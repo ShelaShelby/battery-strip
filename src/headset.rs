@@ -1,122 +1,324 @@
-//! Non-HID++ battery query for Logitech headsets that expose a vendor
-//! collection on usage page 0xFF13 or 0xFFA0 (e.g. G522 LIGHTSPEED, PRO X 2).
+//! Logitech Centurion protocol (G522 LIGHTSPEED headset), as implemented by
+//! HeadsetControl 4.0.0 (lib/devices/protocols/logitech_centurion_protocol.hpp,
+//! lib/devices/logitech_g522_lightspeed.hpp).
 //!
-//! Protocol is a HYPOTHESIS taken from HeadsetControl PR #478 (PRO X 2),
-//! UNVERIFIED on the G522. Only one read-only battery request is ever sent;
-//! a number is shown only if a reply matches the exact signature.
+//! Frames are 64 bytes on the dongle's FFA0 collection: report ID 0x50,
+//! 0x23, LEN, flags 0x00, then the payload. The battery lives on the headset
+//! behind the dongle and is reached through the dongle's bridge feature.
+//! Only read-only getters are ever sent.
 
 use crate::hidpp::{hex, Battery, VID_LOGITECH};
 use crate::scan::HidInfo;
-use std::time::{Duration, Instant};
+use std::fmt;
+use std::time::Duration;
 
-/// Battery request (unverified on G522). Sent zero-padded to the full
-/// output report length.
-pub const REQUEST: [u8; 16] = [
-    0x51, 0x08, 0x00, 0x03, 0x1A, 0x00, 0x03, 0x00, 0x04, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-];
-pub const PREFIX: u8 = 0x51;
-/// Reports read after each send.
-pub const MAX_REPLIES: usize = 4;
-pub const REPLY_TIMEOUT: Duration = Duration::from_millis(700);
-pub const LISTEN: Duration = Duration::from_secs(3);
+pub const PID_G522: u16 = 0x0B18;
+pub const REPORT_ID: u8 = 0x50;
+pub const MARKER: u8 = 0x23;
+pub const FRAME_LEN: usize = 64;
+/// Largest payload that fits a frame (LEN + 3 <= 64).
+pub const MAX_PAYLOAD: usize = FRAME_LEN - 4;
+/// Frames read per request at most.
+pub const MAX_FRAMES: usize = 8;
+pub const READ_TIMEOUT: Duration = Duration::from_millis(1000);
 
-/// Logitech collection the headset query is tried on (any PID).
+const SOFTWARE_ID: u8 = 0x01;
+const BRIDGE_SEND: u8 = 0x10;
+const FEATURE_BRIDGE: u16 = 0x0003;
+const FEATURE_BATTERY_SOC: u16 = 0x0104;
+
+/// The G522 dongle collection that carries Centurion frames.
 pub fn is_headset_iface(i: &HidInfo) -> bool {
-    i.vid == VID_LOGITECH && (i.usage_page == 0xFF13 || i.usage_page == 0xFFA0)
+    i.vid == VID_LOGITECH && i.pid == PID_G522 && i.usage_page == 0xFFA0 && i.usage == 0x0001 && i.interface == Some(3)
 }
 
-/// First non-zero output report ID from the HID caps, 0 if none.
-pub fn caps_report_id(i: &HidInfo) -> u8 {
-    i.output_ids.iter().copied().find(|&x| x != 0).unwrap_or(0)
+/// 64-byte frame carrying `payload` (longer payloads are cut to MAX_PAYLOAD).
+pub fn build_frame(payload: &[u8]) -> [u8; FRAME_LEN] {
+    let p = &payload[..payload.len().min(MAX_PAYLOAD)];
+    let mut f = [0u8; FRAME_LEN];
+    f[0] = REPORT_ID;
+    f[1] = MARKER;
+    f[2] = (p.len() + 1) as u8;
+    f[3] = 0x00;
+    f[4..4 + p.len()].copy_from_slice(p);
+    f
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Variant {
-    /// The packet itself starts at byte 0 (0x51 acts as report ID).
-    A,
-    /// 0x00 (no report ID), then the packet.
-    B,
-    /// Report ID from the caps, then the packet.
-    C(u8),
-}
-
-impl Variant {
-    pub fn label(&self) -> String {
-        match self {
-            Variant::A => "A (packet at byte 0, 0x51 as report ID)".into(),
-            Variant::B => "B (0x00 report ID + packet)".into(),
-            Variant::C(id) => format!("C (caps report ID 0x{:02X} + packet)", id),
-        }
+/// Payload of a Centurion frame, None for anything else.
+pub fn parse_frame(rep: &[u8]) -> Option<&[u8]> {
+    if rep.len() < 3 || rep[0] != REPORT_ID || rep[1] != MARKER {
+        return None;
     }
+    let len = rep[2] as usize;
+    if len <= 1 || len + 3 > FRAME_LEN || len + 3 > rep.len() {
+        return None;
+    }
+    Some(&rep[4..3 + len])
 }
 
-/// Variants in the order they are tried.
-pub fn variants(report_id: u8) -> Vec<Variant> {
-    let mut v = vec![Variant::A, Variant::B];
-    if report_id != 0 {
-        v.push(Variant::C(report_id));
-    }
+/// Request to a dongle feature.
+pub fn direct_payload(feature_index: u8, function: u8, params: &[u8]) -> Vec<u8> {
+    let mut v = vec![feature_index, (function & 0xF0) | SOFTWARE_ID];
+    v.extend_from_slice(params);
     v
 }
 
-/// Request buffer of exactly `out_len` bytes (the interface's
-/// OutputReportByteLength).
-pub fn build_packet(v: Variant, out_len: usize) -> Result<Vec<u8>, String> {
-    let (lead, need) = match v {
-        Variant::A => (None, REQUEST.len()),
-        Variant::B => (Some(0x00), REQUEST.len() + 1),
-        Variant::C(id) => (Some(id), REQUEST.len() + 1),
-    };
-    if out_len < need {
-        return Err(format!("output report length {} too short (need {})", out_len, need));
-    }
-    let mut buf = vec![0u8; out_len];
-    match lead {
-        None => buf[..REQUEST.len()].copy_from_slice(&REQUEST),
-        Some(id) => {
-            buf[0] = id;
-            buf[1..need].copy_from_slice(&REQUEST);
-        }
-    }
-    Ok(buf)
+/// Request to a headset feature, wrapped for the dongle's bridge.
+pub fn bridge_payload(bridge_index: u8, sub_feature_index: u8, function: u8, params: &[u8]) -> Vec<u8> {
+    let mut sub = vec![0x00, sub_feature_index, (function & 0xF0) | SOFTWARE_ID];
+    sub.extend_from_slice(params);
+    let size = sub.len();
+    let mut v = vec![
+        bridge_index,
+        BRIDGE_SEND | SOFTWARE_ID,
+        ((size >> 8) & 0x0F) as u8,
+        (size & 0xFF) as u8,
+    ];
+    v.extend_from_slice(&sub);
+    v
 }
 
-/// Battery answer: byte0 0x51, byte1 0x0B, byte8 0x04, byte10 = 1..=100 %,
-/// byte12 0x02 = charging. Anything else is not a battery answer.
-pub fn decode(rep: &[u8]) -> Option<Battery> {
-    if rep.len() < 13 || rep[0] != PREFIX || rep[1] != 0x0B || rep[8] != 0x04 {
-        return None;
+/// Data of a direct reply to `feature_index`.
+pub fn direct_reply(payload: &[u8], feature_index: u8) -> Option<&[u8]> {
+    if payload.len() >= 2 && payload[0] == feature_index {
+        Some(&payload[2..])
+    } else {
+        None
     }
-    let p = rep[10];
-    if !(1..=100).contains(&p) {
-        return None;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BridgeReply<'a> {
+    Ack,
+    Connected,
+    Offline,
+    Rejected,
+    /// Answer params (payload[7..]).
+    Answer(&'a [u8]),
+    Unrelated,
+}
+
+/// What a frame payload means for a bridge request to `sub_feature_index`.
+pub fn bridge_reply(p: &[u8], bridge_index: u8, sub_feature_index: u8) -> BridgeReply<'_> {
+    if p.len() < 2 || p[0] != bridge_index {
+        return BridgeReply::Unrelated;
     }
-    Some(Battery {
+    match p[1] {
+        0x11 => BridgeReply::Ack,
+        0x00 if p.len() >= 4 => match p[3] {
+            0 => BridgeReply::Offline,
+            1 => BridgeReply::Connected,
+            _ => BridgeReply::Unrelated,
+        },
+        0x10 if p.len() >= 6 && p[4] == 0x00 => {
+            if p[5] == sub_feature_index {
+                BridgeReply::Answer(p.get(7..).unwrap_or(&[]))
+            } else if p[5] == 0xFF {
+                BridgeReply::Rejected
+            } else {
+                BridgeReply::Unrelated
+            }
+        }
+        _ => BridgeReply::Unrelated,
+    }
+}
+
+/// CenturionBatterySoc answer: [0] percent 0..=100, [2] state (1/2 charging).
+pub fn parse_battery(params: &[u8]) -> Result<Battery, Error> {
+    let Some(&p) = params.first() else {
+        return Err(Error::Invalid("empty battery answer".into()));
+    };
+    if p > 100 {
+        return Err(Error::Invalid(format!("battery percent {} out of range", p)));
+    }
+    let state = params.get(2).copied().unwrap_or(0);
+    Ok(Battery {
         percent: p,
         approx: false,
-        charging: rep[12] == 0x02,
+        charging: state == 1 || state == 2,
     })
 }
 
-pub fn is_ack(rep: &[u8]) -> bool {
-    rep.len() >= 2 && rep[0] == PREFIX && rep[1] == 0x03
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Error {
+    Write(String),
+    Read(String),
+    Timeout,
+    TooManyFrames,
+    Rejected,
+    Offline,
+    BridgeNotFound,
+    BatteryNotSupported,
+    Invalid(String),
 }
 
-/// Human-readable tag for the probe log.
-pub fn describe(rep: &[u8]) -> String {
-    if let Some(b) = decode(rep) {
-        return format!("battery answer: {}%{}", b.percent, if b.charging { " charging" } else { "" });
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::Write(e) => write!(f, "write error: {}", e),
+            Error::Read(e) => write!(f, "read error: {}", e),
+            Error::Timeout => write!(f, "timeout (no reply within {} ms)", READ_TIMEOUT.as_millis()),
+            Error::TooManyFrames => write!(f, "no matching reply in {} frames", MAX_FRAMES),
+            Error::Rejected => write!(f, "rejected by the headset (sub feature 0xFF)"),
+            Error::Offline => write!(f, "headset off/disconnected"),
+            Error::BridgeNotFound => write!(f, "bridge feature 0x{:04X} not found (index 0)", FEATURE_BRIDGE),
+            Error::BatteryNotSupported => {
+                write!(f, "battery feature 0x{:04X} not supported (index 0)", FEATURE_BATTERY_SOC)
+            }
+            Error::Invalid(e) => write!(f, "invalid reply: {}", e),
+        }
     }
-    if is_ack(rep) {
-        return "ACK".into();
+}
+
+/// Raw access to the Centurion collection.
+pub trait RawLink {
+    /// One 64-byte output report.
+    fn write(&mut self, buf: &[u8]) -> Result<(), String>;
+    /// One input report, Ok(None) on timeout.
+    fn read(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>, String>;
+}
+
+/// Feature indices found by the two lookups (cached per session).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Indices {
+    pub bridge: u8,
+    pub battery: u8,
+}
+
+pub struct Session<'a, L: RawLink> {
+    link: &'a mut L,
+    log: &'a mut Vec<String>,
+    /// Log every TX/RX frame (probe).
+    verbose: bool,
+}
+
+impl<'a, L: RawLink> Session<'a, L> {
+    pub fn new(link: &'a mut L, log: &'a mut Vec<String>, verbose: bool) -> Self {
+        Session { link, log, verbose }
     }
-    if rep.len() >= 7 && rep[0] == PREFIX && rep[1] == 0x05 {
-        return format!("power event? byte6={}", rep[6]);
+
+    fn trace(&mut self, s: String) {
+        if self.verbose {
+            self.log.push(s);
+        }
     }
-    if rep.len() >= 2 && rep[0] == PREFIX && rep[1] == 0x0B {
-        return "0x51 0x0B but signature/percent not valid -> ignored".into();
+
+    fn send(&mut self, payload: &[u8]) -> Result<(), Error> {
+        let f = build_frame(payload);
+        self.trace(format!("      TX {}", hex_trim(&f)));
+        self.link.write(&f).map_err(Error::Write)
     }
-    "unrelated".into()
+
+    fn next_frame(&mut self) -> Result<Vec<u8>, Error> {
+        match self.link.read(READ_TIMEOUT) {
+            Ok(Some(r)) => Ok(r),
+            Ok(None) => Err(Error::Timeout),
+            Err(e) => Err(Error::Read(e)),
+        }
+    }
+
+    /// Direct request; returns the reply data (payload[2..]).
+    pub fn direct(&mut self, feature_index: u8, function: u8, params: &[u8]) -> Result<Vec<u8>, Error> {
+        self.send(&direct_payload(feature_index, function, params))?;
+        for _ in 0..MAX_FRAMES {
+            let rep = self.next_frame()?;
+            let data = parse_frame(&rep).and_then(|p| direct_reply(p, feature_index));
+            self.trace(format!(
+                "      RX {}  [{}]",
+                hex_trim(&rep),
+                if data.is_some() { "reply" } else { "unrelated, skipped" }
+            ));
+            if let Some(d) = data {
+                return Ok(d.to_vec());
+            }
+        }
+        Err(Error::TooManyFrames)
+    }
+
+    /// Bridge request to the headset; returns the answer params.
+    pub fn bridge(&mut self, bridge_index: u8, sub_feature_index: u8, function: u8, params: &[u8]) -> Result<Vec<u8>, Error> {
+        self.send(&bridge_payload(bridge_index, sub_feature_index, function, params))?;
+        for _ in 0..MAX_FRAMES {
+            let rep = self.next_frame()?;
+            let r = parse_frame(&rep).map(|p| bridge_reply(p, bridge_index, sub_feature_index));
+            let tag = match r {
+                Some(BridgeReply::Ack) => "ACK",
+                Some(BridgeReply::Connected) => "connected event, skipped",
+                Some(BridgeReply::Offline) => "disconnect event",
+                Some(BridgeReply::Rejected) => "rejected",
+                Some(BridgeReply::Answer(_)) => "answer",
+                Some(BridgeReply::Unrelated) | None => "unrelated, skipped",
+            };
+            self.trace(format!("      RX {}  [{}]", hex_trim(&rep), tag));
+            match r {
+                Some(BridgeReply::Answer(a)) => return Ok(a.to_vec()),
+                Some(BridgeReply::Offline) => return Err(Error::Offline),
+                Some(BridgeReply::Rejected) => return Err(Error::Rejected),
+                _ => {}
+            }
+        }
+        Err(Error::TooManyFrames)
+    }
+
+    /// Step 1: Root lookup of the bridge feature on the dongle.
+    pub fn lookup_bridge(&mut self) -> Result<u8, Error> {
+        let d = self.direct(0x00, 0x00, &FEATURE_BRIDGE.to_be_bytes())?;
+        match d.first() {
+            Some(&i) if i != 0 => Ok(i),
+            _ => Err(Error::BridgeNotFound),
+        }
+    }
+
+    /// Step 2: Root lookup of CenturionBatterySoc on the headset.
+    pub fn lookup_battery(&mut self, bridge_index: u8) -> Result<u8, Error> {
+        let a = self.bridge(bridge_index, 0x00, 0x00, &FEATURE_BATTERY_SOC.to_be_bytes())?;
+        match a.first() {
+            Some(&i) if i != 0 => Ok(i),
+            _ => Err(Error::BatteryNotSupported),
+        }
+    }
+
+    /// Step 3: battery read.
+    pub fn read_battery(&mut self, ix: Indices) -> Result<Battery, Error> {
+        let a = self.bridge(ix.bridge, ix.battery, 0x00, &[])?;
+        parse_battery(&a)
+    }
+
+    /// Steps 1-3, reusing `cache`. Any error except Offline clears it.
+    pub fn query(&mut self, cache: &mut Option<Indices>) -> Result<Battery, Error> {
+        let ix = match *cache {
+            Some(ix) => ix,
+            None => {
+                self.trace("   1) bridge lookup (direct Root, feature 0x0003)".into());
+                let bridge = self.lookup_bridge()?;
+                self.trace(format!("      bridge_index 0x{:02X}", bridge));
+                self.trace("   2) battery lookup (bridge Root, feature 0x0104)".into());
+                let battery = self.lookup_battery(bridge)?;
+                self.trace(format!("      battery_index 0x{:02X}", battery));
+                Indices { bridge, battery }
+            }
+        };
+        self.trace("   3) battery read".into());
+        match self.read_battery(ix) {
+            Ok(b) => {
+                *cache = Some(ix);
+                self.trace(format!(
+                    "      percent {}, {}",
+                    b.percent,
+                    if b.charging { "charging" } else { "not charging" }
+                ));
+                Ok(b)
+            }
+            Err(Error::Offline) => {
+                *cache = Some(ix);
+                Err(Error::Offline)
+            }
+            Err(e) => {
+                *cache = None;
+                Err(e)
+            }
+        }
+    }
 }
 
 /// Hex with the trailing zero bytes summarised.
@@ -129,137 +331,10 @@ pub fn hex_trim(b: &[u8]) -> String {
     }
 }
 
-/// Raw access to one HID collection.
-pub trait RawLink {
-    fn write_file(&mut self, buf: &[u8]) -> Result<(), String>;
-    fn set_output_report(&mut self, buf: &[u8]) -> Result<(), String>;
-    /// One input report, Ok(None) on timeout.
-    fn read(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>, String>;
-}
-
-/// Log every unsolicited report for `dur`; returns how many arrived.
-pub fn listen<L: RawLink>(link: &mut L, dur: Duration, log: &mut Vec<String>) -> usize {
-    let deadline = Instant::now() + dur;
-    let mut n = 0;
-    loop {
-        let now = Instant::now();
-        if now >= deadline {
-            break;
-        }
-        match link.read(deadline - now) {
-            Ok(Some(r)) => {
-                n += 1;
-                log.push(format!("    unsolicited: {}  [{}]", hex(&r), describe(&r)));
-            }
-            Ok(None) => break,
-            Err(e) => {
-                log.push(format!("    read failed: {}", e));
-                break;
-            }
-        }
-    }
-    n
-}
-
-#[derive(Debug, Default)]
-pub struct QueryResult {
-    /// First error text if the request could not be sent.
-    pub error: Option<String>,
-    pub replies: usize,
-    pub battery: Option<Battery>,
-}
-
-/// Send the battery request with one variant and read up to MAX_REPLIES
-/// reports (ACK first, then data, is expected).
-pub fn query<L: RawLink>(link: &mut L, v: Variant, out_len: usize, log: &mut Vec<String>) -> QueryResult {
-    let mut q = QueryResult::default();
-    let buf = match build_packet(v, out_len) {
-        Ok(b) => b,
-        Err(e) => {
-            log.push(format!("    variant {}: not sent: {}", v.label(), e));
-            q.error = Some(e);
-            return q;
-        }
-    };
-    log.push(format!("    variant {}", v.label()));
-    log.push(format!("    TX {}", hex_trim(&buf)));
-    match link.write_file(&buf) {
-        Ok(()) => log.push("    sent with WriteFile".into()),
-        Err(e1) => {
-            log.push(format!("    WriteFile failed: {}", e1));
-            match link.set_output_report(&buf) {
-                Ok(()) => log.push("    sent with HidD_SetOutputReport".into()),
-                Err(e2) => {
-                    log.push(format!("    HidD_SetOutputReport failed: {}", e2));
-                    q.error = Some(format!("WriteFile: {}", e1));
-                    return q;
-                }
-            }
-        }
-    }
-    for _ in 0..MAX_REPLIES {
-        match link.read(REPLY_TIMEOUT) {
-            Ok(Some(r)) => {
-                q.replies += 1;
-                log.push(format!("    RX {}  [{}]", hex(&r), describe(&r)));
-                if let Some(b) = decode(&r) {
-                    q.battery = Some(b);
-                    break;
-                }
-            }
-            Ok(None) => {
-                log.push(format!("    no (more) reports within {} ms", REPLY_TIMEOUT.as_millis()));
-                break;
-            }
-            Err(e) => {
-                log.push(format!("    read failed: {}", e));
-                break;
-            }
-        }
-    }
-    q
-}
-
-#[derive(Debug, Default)]
-pub struct ProbeResult {
-    /// Variant that got any reply (remembered for polling).
-    pub variant: Option<Variant>,
-    pub battery: Option<Battery>,
-    /// (variant, first error text) for variants that could not be sent.
-    pub errors: Vec<(Variant, String)>,
-}
-
-/// Try the variants in order; stop at the first that gets any reply.
-pub fn try_variants<L: RawLink>(link: &mut L, report_id: u8, out_len: usize, log: &mut Vec<String>) -> ProbeResult {
-    let mut res = ProbeResult::default();
-    for v in variants(report_id) {
-        let q = query(link, v, out_len, log);
-        if let Some(e) = q.error {
-            res.errors.push((v, e));
-        }
-        if q.replies > 0 {
-            res.variant = Some(v);
-            res.battery = q.battery;
-            break;
-        }
-    }
-    res
-}
-
 #[cfg(test)]
 pub mod tests {
     use super::*;
     use std::collections::VecDeque;
-
-    // Example packets from HeadsetControl PR #478 (PRO X 2): unverified on G522.
-    /// unverified on G522: battery 57 %, charging.
-    pub const EX_BATTERY_CHARGING: [u8; 16] = [
-        0x51, 0x0B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 57, 0x00, 0x02, 0x00, 0x00, 0x00,
-    ];
-    /// unverified on G522: ACK.
-    pub const EX_ACK: [u8; 4] = [0x51, 0x03, 0x00, 0x00];
-    /// unverified on G522: power-on event.
-    pub const EX_POWER_ON: [u8; 8] = [0x51, 0x05, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00];
 
     pub fn pad(b: &[u8], n: usize) -> Vec<u8> {
         let mut v = b.to_vec();
@@ -267,56 +342,96 @@ pub mod tests {
         v
     }
 
-    /// Fake headset collection. `accept` decides which first byte of a
-    /// request it answers (None = silent).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Mode {
+        Online,
+        Offline,
+        Rejected,
+        Silent,
+    }
+
+    /// Fake G522 dongle + headset answering the three Centurion requests.
     pub struct FakeHeadset {
-        pub out_len: usize,
-        pub accept: Option<u8>,
-        pub writefile_fails: bool,
-        pub setoutput_fails: bool,
-        pub replies: Vec<Vec<u8>>,
+        pub bridge: u8,
+        pub battery: u8,
+        pub percent: u8,
+        pub state: u8,
+        pub mode: Mode,
+        /// Unrelated frame queued before every reply.
+        pub noise: bool,
+        pub write_fails: bool,
         pub queue: VecDeque<Vec<u8>>,
-        pub sent: Vec<(&'static str, Vec<u8>)>,
+        pub sent: Vec<Vec<u8>>,
         pub reads: usize,
     }
 
     impl FakeHeadset {
-        pub fn new(out_len: usize, accept: Option<u8>, replies: Vec<Vec<u8>>) -> Self {
+        pub fn new(mode: Mode) -> Self {
             FakeHeadset {
-                out_len,
-                accept,
-                writefile_fails: false,
-                setoutput_fails: false,
-                replies,
+                bridge: 0x05,
+                battery: 0x07,
+                percent: 85,
+                state: 1,
+                mode,
+                noise: false,
+                write_fails: false,
                 queue: VecDeque::new(),
                 sent: vec![],
                 reads: 0,
             }
         }
-        fn take(&mut self, how: &'static str, buf: &[u8]) -> Result<(), String> {
-            if buf.len() != self.out_len {
-                return Err("Win32 error 87".into());
+
+        fn push(&mut self, payload: &[u8]) {
+            if self.noise {
+                self.queue.push_back(pad(&[0x51, 0x0B, 0x00, 0x00], 64));
             }
-            self.sent.push((how, buf.to_vec()));
-            if self.accept == Some(buf[0]) {
-                self.queue.extend(self.replies.iter().cloned());
+            self.queue.push_back(build_frame(payload).to_vec());
+        }
+
+        fn answer(&mut self, req: &[u8]) {
+            let p = parse_frame(req).expect("request is a Centurion frame").to_vec();
+            if self.mode == Mode::Silent {
+                return;
             }
-            Ok(())
+            if p[0] == 0x00 {
+                if p[1] == 0x01 && p[2..] == [0x00, 0x03] {
+                    let b = self.bridge;
+                    self.push(&[0x00, 0x01, b, 0x00, 0x00]);
+                }
+                return;
+            }
+            if p[0] != self.bridge || p[1] != 0x11 {
+                return;
+            }
+            let b = self.bridge;
+            self.push(&[b, 0x11, 0x00, 0x00]);
+            let sub = &p[4..];
+            match self.mode {
+                Mode::Offline => self.push(&[b, 0x00, 0x00, 0x00]),
+                Mode::Rejected => self.push(&[b, 0x10, 0x00, 0x04, 0x00, 0xFF, sub[1], 0x05]),
+                _ => {
+                    let params: Vec<u8> = match (sub[1], &sub[3..]) {
+                        (0x00, [0x01, 0x04]) => vec![self.battery, 0x00, 0x00],
+                        (s, []) if s == self.battery => vec![self.percent, 0x00, self.state],
+                        _ => return,
+                    };
+                    let mut a = vec![b, 0x10, 0x00, (params.len() + 3) as u8, 0x00, sub[1], sub[2]];
+                    a.extend_from_slice(&params);
+                    self.push(&a);
+                }
+            }
         }
     }
 
     impl RawLink for FakeHeadset {
-        fn write_file(&mut self, buf: &[u8]) -> Result<(), String> {
-            if self.writefile_fails {
-                return Err("Win32 error 87".into());
+        fn write(&mut self, buf: &[u8]) -> Result<(), String> {
+            if self.write_fails {
+                return Err("WriteFile failed: Win32 error 87 (invalid parameter)".into());
             }
-            self.take("WriteFile", buf)
-        }
-        fn set_output_report(&mut self, buf: &[u8]) -> Result<(), String> {
-            if self.setoutput_fails {
-                return Err("Win32 error 1".into());
-            }
-            self.take("SetOutputReport", buf)
+            assert_eq!(buf.len(), FRAME_LEN);
+            self.sent.push(buf.to_vec());
+            self.answer(buf);
+            Ok(())
         }
         fn read(&mut self, _t: Duration) -> Result<Option<Vec<u8>>, String> {
             self.reads += 1;
@@ -324,170 +439,96 @@ pub mod tests {
         }
     }
 
+    fn bytes(s: &str) -> Vec<u8> {
+        s.split_whitespace().map(|x| u8::from_str_radix(x, 16).unwrap()).collect()
+    }
+
+    fn assert_frame(f: &[u8; FRAME_LEN], head: &str) {
+        let h = bytes(head);
+        assert_eq!(&f[..h.len()], &h[..], "{}", hex(f));
+        assert!(f[h.len()..].iter().all(|&x| x == 0), "{}", hex(f));
+    }
+
     #[test]
-    fn packet_variants_exact_lengths() {
-        for n in [62usize, 64] {
-            let a = build_packet(Variant::A, n).unwrap();
-            assert_eq!(a.len(), n);
-            assert_eq!(&a[..16], &REQUEST);
-            assert!(a[16..].iter().all(|&b| b == 0));
-            let b = build_packet(Variant::B, n).unwrap();
-            assert_eq!(b.len(), n);
-            assert_eq!(b[0], 0x00);
-            assert_eq!(&b[1..17], &REQUEST);
-            assert!(b[17..].iter().all(|&x| x == 0));
-            let c = build_packet(Variant::C(0x51), n).unwrap();
-            assert_eq!(c.len(), n);
-            assert_eq!(c[0], 0x51);
-            assert_eq!(&c[1..17], &REQUEST);
+    fn vector_a_direct_root_lookup() {
+        let f = build_frame(&direct_payload(0x00, 0x00, &[0x00, 0x03]));
+        assert_frame(&f, "50 23 05 00 00 01 00 03");
+    }
+
+    #[test]
+    fn vector_b_bridge_root_lookup() {
+        let f = build_frame(&bridge_payload(0x05, 0x00, 0x00, &[0x01, 0x04]));
+        assert_frame(&f, "50 23 0A 00 05 11 00 05 00 00 01 01 04");
+    }
+
+    #[test]
+    fn vector_c_bridge_battery_read() {
+        let f = build_frame(&bridge_payload(0x05, 0x07, 0x00, &[]));
+        assert_frame(&f, "50 23 08 00 05 11 00 03 00 07 01");
+    }
+
+    #[test]
+    fn vector_d_answer() {
+        let p = bytes("05 10 00 06 00 07 00 55 00 01");
+        let BridgeReply::Answer(params) = bridge_reply(&p, 0x05, 0x07) else {
+            panic!("not an answer");
+        };
+        assert_eq!(params, &[0x55, 0x00, 0x01]);
+        let b = parse_battery(params).unwrap();
+        assert_eq!((b.percent, b.charging, b.approx), (85, true, false));
+        // Round trip through a frame.
+        let f = build_frame(&p);
+        assert_eq!(parse_frame(&f), Some(&p[..]));
+    }
+
+    #[test]
+    fn vector_e_ack_disconnect_rejected() {
+        assert_eq!(bridge_reply(&bytes("05 11 00 00"), 5, 7), BridgeReply::Ack);
+        assert_eq!(bridge_reply(&bytes("05 00 00 00"), 5, 7), BridgeReply::Offline);
+        assert_eq!(bridge_reply(&bytes("05 00 00 01"), 5, 7), BridgeReply::Connected);
+        assert_eq!(bridge_reply(&bytes("05 10 00 04 00 FF 07 05"), 5, 7), BridgeReply::Rejected);
+        // Other bridge, other sub feature, short connection event.
+        assert_eq!(bridge_reply(&bytes("06 10 00 06 00 07 00 55 00 01"), 5, 7), BridgeReply::Unrelated);
+        assert_eq!(bridge_reply(&bytes("05 10 00 06 00 08 00 55 00 01"), 5, 7), BridgeReply::Unrelated);
+        assert_eq!(bridge_reply(&bytes("05 10 00 06 01 07 00 55 00 01"), 5, 7), BridgeReply::Unrelated);
+        assert_eq!(bridge_reply(&bytes("05 00 00"), 5, 7), BridgeReply::Unrelated);
+        assert_eq!(bridge_reply(&bytes("05"), 5, 7), BridgeReply::Unrelated);
+    }
+
+    #[test]
+    fn vector_f_bad_frames() {
+        let good = pad(&bytes("50 23 05 00 00 01 05 00 00"), 64);
+        assert_eq!(parse_frame(&good), Some(&[0x00, 0x01, 0x05, 0x00][..]));
+        for (i, v) in [(0usize, 0x51u8), (1, 0x22)] {
+            let mut x = good.clone();
+            x[i] = v;
+            assert_eq!(parse_frame(&x), None, "prefix byte {}", i);
         }
-        // Request bytes as published (unverified on G522).
-        assert_eq!(hex(&REQUEST[..10]), "51 08 00 03 1A 00 03 00 04 0A");
-        assert!(build_packet(Variant::A, 15).is_err());
-        assert!(build_packet(Variant::B, 16).is_err());
-        assert!(build_packet(Variant::A, 0).is_err());
-        assert_eq!(build_packet(Variant::A, 16).unwrap().len(), 16);
-    }
-
-    #[test]
-    fn variant_order() {
-        assert_eq!(variants(0), vec![Variant::A, Variant::B]);
-        assert_eq!(variants(0x20), vec![Variant::A, Variant::B, Variant::C(0x20)]);
-    }
-
-    #[test]
-    fn decoder_signature() {
-        let b = decode(&pad(&EX_BATTERY_CHARGING, 64)).unwrap();
-        assert_eq!(b.percent, 57);
-        assert!(b.charging);
-        assert!(!b.approx);
-        let mut x = pad(&EX_BATTERY_CHARGING, 62);
-        x[12] = 0x00;
-        assert!(!decode(&x).unwrap().charging);
-        x[12] = 0x01;
-        assert!(!decode(&x).unwrap().charging);
-        for (i, v) in [(0usize, 0x50u8), (1, 0x0A), (8, 0x05)] {
-            let mut y = pad(&EX_BATTERY_CHARGING, 64);
-            y[i] = v;
-            assert_eq!(decode(&y), None, "byte {} changed", i);
+        for len in [0u8, 1, 62, 0xFF] {
+            let mut x = good.clone();
+            x[2] = len;
+            assert_eq!(parse_frame(&x), None, "LEN {}", len);
         }
-        for p in [0u8, 101, 255] {
-            let mut y = pad(&EX_BATTERY_CHARGING, 64);
-            y[10] = p;
-            assert_eq!(decode(&y), None, "percent {}", p);
+        let mut x = good.clone();
+        x[2] = 61;
+        assert_eq!(parse_frame(&x).unwrap().len(), 60);
+        // Short read: LEN beyond the bytes received.
+        assert_eq!(parse_frame(&good[..7]), None);
+        assert_eq!(parse_frame(&good[..2]), None);
+        assert_eq!(parse_frame(&[]), None);
+    }
+
+    #[test]
+    fn battery_values() {
+        assert_eq!(parse_battery(&[0, 0, 0]).unwrap().percent, 0);
+        assert_eq!(parse_battery(&[100, 0, 0]).unwrap().percent, 100);
+        assert!(parse_battery(&[101, 0, 0]).is_err());
+        assert!(parse_battery(&[0xFF]).is_err());
+        assert!(parse_battery(&[]).is_err());
+        for (state, charging) in [(0u8, false), (1, true), (2, true), (3, false), (0xFF, false)] {
+            assert_eq!(parse_battery(&[50, 0, state]).unwrap().charging, charging, "state {}", state);
         }
-        for p in [1u8, 100] {
-            let mut y = pad(&EX_BATTERY_CHARGING, 64);
-            y[10] = p;
-            assert_eq!(decode(&y).unwrap().percent, p);
-        }
-        // Report-ID-0 prefixed copy is not accepted, nor too short.
-        let mut z = vec![0u8];
-        z.extend_from_slice(&EX_BATTERY_CHARGING);
-        assert_eq!(decode(&z), None);
-        assert_eq!(decode(&EX_BATTERY_CHARGING[..12]), None);
-        assert_eq!(decode(&pad(&EX_ACK, 64)), None);
-        assert_eq!(decode(&pad(&EX_POWER_ON, 64)), None);
-        assert!(is_ack(&EX_ACK));
-        assert!(describe(&EX_POWER_ON).starts_with("power event"));
-    }
-
-    #[test]
-    fn ack_then_data() {
-        let mut d = FakeHeadset::new(64, Some(0x51), vec![pad(&EX_ACK, 64), pad(&EX_BATTERY_CHARGING, 64)]);
-        let mut log = Vec::new();
-        let q = query(&mut d, Variant::A, 64, &mut log);
-        assert_eq!(q.replies, 2);
-        assert_eq!(q.battery.unwrap().percent, 57);
-        assert_eq!(d.reads, 2);
-        assert_eq!(d.sent.len(), 1);
-        let t = log.join("\n");
-        assert!(t.contains("[ACK]"), "{}", t);
-        assert!(t.contains("TX 51 08 00 03 1A 00 03 00 04 0A + 54 zero bytes (64 total)"), "{}", t);
-    }
-
-    #[test]
-    fn unrelated_reports_read_at_most_four() {
-        let junk = pad(&[0x51, 0x05, 0, 0, 0, 0, 1], 62);
-        let mut d = FakeHeadset::new(62, Some(0x51), vec![junk.clone(); 6]);
-        let mut log = Vec::new();
-        let q = query(&mut d, Variant::A, 62, &mut log);
-        assert_eq!(q.replies, MAX_REPLIES);
-        assert_eq!(q.battery, None);
-        assert_eq!(d.reads, MAX_REPLIES);
-    }
-
-    #[test]
-    fn fallback_order_stops_on_first_reply() {
-        // Answers only variant B (first byte 0x00).
-        let mut d = FakeHeadset::new(64, Some(0x00), vec![pad(&EX_ACK, 64), pad(&EX_BATTERY_CHARGING, 64)]);
-        let mut log = Vec::new();
-        let r = try_variants(&mut d, 0x20, 64, &mut log);
-        assert_eq!(r.variant, Some(Variant::B));
-        assert_eq!(r.battery.unwrap().percent, 57);
-        assert_eq!(d.sent.len(), 2);
-        assert_eq!(d.sent[0].1[0], 0x51);
-        assert_eq!(d.sent[1].1[0], 0x00);
-    }
-
-    #[test]
-    fn reply_without_battery_still_stops() {
-        let mut d = FakeHeadset::new(64, Some(0x51), vec![pad(&EX_ACK, 64)]);
-        let mut log = Vec::new();
-        let r = try_variants(&mut d, 0x20, 64, &mut log);
-        assert_eq!(r.variant, Some(Variant::A));
-        assert_eq!(r.battery, None);
-        assert_eq!(d.sent.len(), 1);
-    }
-
-    #[test]
-    fn writefile_fails_then_set_output_report() {
-        let mut d = FakeHeadset::new(62, Some(0x51), vec![pad(&EX_BATTERY_CHARGING, 62)]);
-        d.writefile_fails = true;
-        let mut log = Vec::new();
-        let r = try_variants(&mut d, 0, 62, &mut log);
-        assert_eq!(r.variant, Some(Variant::A));
-        assert_eq!(d.sent[0].0, "SetOutputReport");
-        assert!(r.errors.is_empty());
-    }
-
-    #[test]
-    fn all_fail_logs_first_error_per_variant() {
-        let mut d = FakeHeadset::new(64, Some(0x51), vec![]);
-        d.writefile_fails = true;
-        d.setoutput_fails = true;
-        let mut log = Vec::new();
-        let r = try_variants(&mut d, 0x07, 64, &mut log);
-        assert_eq!(r.variant, None);
-        assert_eq!(r.battery, None);
-        let vs: Vec<Variant> = r.errors.iter().map(|e| e.0).collect();
-        assert_eq!(vs, vec![Variant::A, Variant::B, Variant::C(0x07)]);
-        assert!(r.errors.iter().all(|e| e.1 == "WriteFile: Win32 error 87"));
-        assert_eq!(d.reads, 0);
-    }
-
-    #[test]
-    fn silent_device_times_out_quickly() {
-        let mut d = FakeHeadset::new(64, None, vec![]);
-        let mut log = Vec::new();
-        let r = try_variants(&mut d, 0, 64, &mut log);
-        assert_eq!(r.variant, None);
-        assert_eq!(r.battery, None);
-        // One timed-out read per variant, never more.
-        assert_eq!(d.reads, 2);
-        assert_eq!(d.sent.len(), 2);
-        assert!(log.join("\n").contains("no (more) reports within 700 ms"));
-        assert_eq!(listen(&mut d, LISTEN, &mut log), 0);
-    }
-
-    #[test]
-    fn listen_logs_unsolicited() {
-        let mut d = FakeHeadset::new(64, None, vec![]);
-        d.queue.push_back(pad(&EX_POWER_ON, 64));
-        let mut log = Vec::new();
-        assert_eq!(listen(&mut d, LISTEN, &mut log), 1);
-        assert!(log[0].contains("unsolicited: 51 05 00 00 00 00 01 00"));
-        assert!(d.sent.is_empty());
+        assert!(!parse_battery(&[50]).unwrap().charging);
     }
 
     #[test]
@@ -496,20 +537,108 @@ pub mod tests {
             vid: 0x046D,
             pid: 0x0B18,
             usage_page: 0xFFA0,
-            output_len: 64,
+            usage: 1,
+            interface: Some(3),
             ..Default::default()
         };
         assert!(is_headset_iface(&i));
         i.usage_page = 0xFF13;
-        assert!(is_headset_iface(&i));
-        i.usage_page = 0x000C;
-        assert!(!is_headset_iface(&i));
-        i.usage_page = 0xFF00;
         assert!(!is_headset_iface(&i));
         i.usage_page = 0xFFA0;
-        i.vid = 0x1234;
+        i.interface = Some(2);
         assert!(!is_headset_iface(&i));
-        i.output_ids = vec![0, 0x51];
-        assert_eq!(caps_report_id(&i), 0x51);
+        i.interface = Some(3);
+        i.pid = 0x0B19;
+        assert!(!is_headset_iface(&i));
+        i.pid = 0x0B18;
+        i.usage = 2;
+        assert!(!is_headset_iface(&i));
+    }
+
+    #[test]
+    fn full_query_then_cached() {
+        let mut d = FakeHeadset::new(Mode::Online);
+        d.noise = true;
+        let mut log = Vec::new();
+        let mut cache = None;
+        let b = Session::new(&mut d, &mut log, true).query(&mut cache).unwrap();
+        assert_eq!((b.percent, b.charging), (85, true));
+        assert_eq!(cache, Some(Indices { bridge: 5, battery: 7 }));
+        assert_eq!(d.sent.len(), 3);
+        assert_frame(&d.sent[0].clone().try_into().unwrap(), "50 23 05 00 00 01 00 03");
+        assert_frame(&d.sent[1].clone().try_into().unwrap(), "50 23 0A 00 05 11 00 05 00 00 01 01 04");
+        assert_frame(&d.sent[2].clone().try_into().unwrap(), "50 23 08 00 05 11 00 03 00 07 01");
+        let t = log.join("\n");
+        assert!(t.contains("TX 50 23 05 00 00 01 00 03 + 56 zero bytes (64 total)"), "{}", t);
+        assert!(t.contains("bridge_index 0x05") && t.contains("battery_index 0x07"), "{}", t);
+        assert!(t.contains("[ACK]") && t.contains("[unrelated, skipped]"), "{}", t);
+        assert!(t.contains("percent 85, charging"), "{}", t);
+        // Second poll: only the battery read.
+        d.sent.clear();
+        d.state = 0;
+        d.percent = 40;
+        let mut quiet = Vec::new();
+        let b = Session::new(&mut d, &mut quiet, false).query(&mut cache).unwrap();
+        assert_eq!((b.percent, b.charging), (40, false));
+        assert_eq!(d.sent.len(), 1);
+        assert!(quiet.is_empty());
+    }
+
+    #[test]
+    fn offline_keeps_cache_rejected_clears_it() {
+        let ix = Some(Indices { bridge: 5, battery: 7 });
+        let mut d = FakeHeadset::new(Mode::Offline);
+        let mut log = Vec::new();
+        let mut cache = ix;
+        assert_eq!(Session::new(&mut d, &mut log, false).query(&mut cache), Err(Error::Offline));
+        assert_eq!(cache, ix);
+        let mut d = FakeHeadset::new(Mode::Rejected);
+        assert_eq!(Session::new(&mut d, &mut log, false).query(&mut cache), Err(Error::Rejected));
+        assert_eq!(cache, None);
+        // Offline during the lookup: nothing cached.
+        let mut d = FakeHeadset::new(Mode::Offline);
+        assert_eq!(Session::new(&mut d, &mut log, false).query(&mut cache), Err(Error::Offline));
+        assert_eq!(cache, None);
+        assert_eq!(d.sent.len(), 2);
+    }
+
+    #[test]
+    fn timeout_and_write_error() {
+        let mut d = FakeHeadset::new(Mode::Silent);
+        let mut log = Vec::new();
+        let mut cache = Some(Indices { bridge: 5, battery: 7 });
+        assert_eq!(Session::new(&mut d, &mut log, false).query(&mut cache), Err(Error::Timeout));
+        assert_eq!(cache, None);
+        assert_eq!(d.reads, 1);
+        let mut d = FakeHeadset::new(Mode::Online);
+        d.write_fails = true;
+        let e = Session::new(&mut d, &mut log, false).query(&mut cache).unwrap_err();
+        assert_eq!(e.to_string(), "write error: WriteFile failed: Win32 error 87 (invalid parameter)");
+        assert_eq!(Error::Timeout.to_string(), "timeout (no reply within 1000 ms)");
+    }
+
+    #[test]
+    fn at_most_eight_frames() {
+        let mut d = FakeHeadset::new(Mode::Silent);
+        for _ in 0..20 {
+            d.queue.push_back(pad(&[0x50, 0x23, 0x05, 0x00, 0x09, 0x01], 64));
+        }
+        let mut log = Vec::new();
+        assert_eq!(Session::new(&mut d, &mut log, false).lookup_bridge(), Err(Error::TooManyFrames));
+        assert_eq!(d.reads, MAX_FRAMES);
+    }
+
+    #[test]
+    fn index_zero_is_not_found() {
+        let mut d = FakeHeadset::new(Mode::Online);
+        d.bridge = 0;
+        let mut log = Vec::new();
+        assert_eq!(Session::new(&mut d, &mut log, false).lookup_bridge(), Err(Error::BridgeNotFound));
+        let mut d = FakeHeadset::new(Mode::Online);
+        d.battery = 0;
+        assert_eq!(
+            Session::new(&mut d, &mut log, false).lookup_battery(5),
+            Err(Error::BatteryNotSupported)
+        );
     }
 }

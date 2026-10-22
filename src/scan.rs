@@ -2,7 +2,7 @@
 //! The Windows HID backend implements `Link`/`Backend`; tests use a fake.
 //! Only read-only HID++ getters are ever sent.
 
-use crate::headset::{self, RawLink, Variant};
+use crate::headset::{self, RawLink};
 use crate::hidpp::{self, feature, Battery, Kind, Reply, LONG_LEN, PARAMS_LEN};
 use std::time::{Duration, Instant};
 
@@ -61,10 +61,14 @@ impl HidInfo {
 }
 
 /// Logitech vendor-specific collection that can carry long HID++ reports.
-/// Headset collections (0xFF13/0xFFA0) are not HID++ and get only the
-/// headset battery request (see `headset`).
+/// Headset collections (0xFF13/0xFFA0) are not HID++ and never get HID++
+/// requests (the battery is read over Centurion, see `headset`).
 pub fn is_candidate(i: &HidInfo) -> bool {
-    i.vid == hidpp::VID_LOGITECH && i.usage_page >= 0xFF00 && i.output_len as usize >= LONG_LEN && !headset::is_headset_iface(i)
+    i.vid == hidpp::VID_LOGITECH
+        && i.usage_page >= 0xFF00
+        && i.output_len as usize >= LONG_LEN
+        && i.usage_page != 0xFF13
+        && i.usage_page != 0xFFA0
 }
 
 /// Parse "&mi_02" from a Windows HID path.
@@ -115,7 +119,7 @@ pub trait Backend {
     /// collection to also read from.
     fn open(&mut self, info: &HidInfo, sibling: Option<&HidInfo>) -> Result<Self::L, String>;
     type R: RawLink;
-    /// Open one collection shared read/write for the headset request.
+    /// Open the Centurion collection shared read/write (one per poll).
     fn open_raw(&mut self, info: &HidInfo) -> Result<Self::R, String>;
 }
 
@@ -503,20 +507,13 @@ pub struct Readings {
     pub headset: Option<Battery>,
 }
 
-/// Headset collection and request variant that got a reply.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RawFound {
-    pub path: String,
-    pub variant: Variant,
-}
-
 /// Normal-mode poller: re-read known devices, rescan for missing ones.
 #[derive(Default)]
 pub struct Poller {
     pub mouse: Option<Found>,
     pub headset: Option<Found>,
-    /// Remembered (in memory only) headset request variant.
-    pub raw: Option<RawFound>,
+    /// Centurion bridge/battery indices (in memory only).
+    pub centurion: Option<headset::Indices>,
 }
 
 impl Poller {
@@ -593,49 +590,31 @@ impl Poller {
         r
     }
 
-    /// Non-HID++ headset request on 0xFF13/0xFFA0 collections. Bounded by
-    /// the per-report timeouts; run after the mouse has been published.
+    /// Centurion battery read on the G522 collection: open, query, close.
+    /// Bounded by the read timeouts; run after the mouse has been published.
+    /// None (grey "H --") when the headset is off or the read failed.
     pub fn poll_headset<B: Backend>(&mut self, backend: &mut B, infos: &[HidInfo], log: &mut Vec<String>) -> Option<Battery> {
-        let cands: Vec<&HidInfo> = infos.iter().filter(|i| headset::is_headset_iface(i)).collect();
+        let Some(info) = infos.iter().find(|i| headset::is_headset_iface(i)) else {
+            self.centurion = None;
+            return None;
+        };
+        let mut link = match backend.open_raw(info) {
+            Ok(l) => l,
+            Err(e) => {
+                log.push(format!("headset: open failed ({}), will retry", e));
+                self.centurion = None;
+                return None;
+            }
+        };
         let mut scratch = Vec::new();
-        if let Some(rf) = self.raw.clone() {
-            if let Some(info) = cands.iter().find(|i| i.path == rf.path) {
-                match backend.open_raw(info) {
-                    Ok(mut link) => {
-                        let q = headset::query(&mut link, rf.variant, info.output_len as usize, &mut scratch);
-                        if q.error.is_none() {
-                            return q.battery;
-                        }
-                        log.push(format!(
-                            "headset: request failed ({}), will retry all variants",
-                            q.error.unwrap_or_default()
-                        ));
-                    }
-                    Err(e) => log.push(format!("headset: open failed ({}), will retry", e)),
-                }
-            }
-            self.raw = None;
-        }
-        for info in cands {
-            let Ok(mut link) = backend.open_raw(info) else {
-                continue;
-            };
-            let res = headset::try_variants(&mut link, headset::caps_report_id(info), info.output_len as usize, &mut scratch);
-            if let Some(v) = res.variant {
-                log.push(format!(
-                    "headset: PID {:04X} usage page {:04X} replies to variant {}",
-                    info.pid,
-                    info.usage_page,
-                    v.label()
-                ));
-                self.raw = Some(RawFound {
-                    path: info.path.clone(),
-                    variant: v,
-                });
-                return res.battery;
+        match headset::Session::new(&mut link, &mut scratch, false).query(&mut self.centurion) {
+            Ok(b) => Some(b),
+            Err(headset::Error::Offline) => None,
+            Err(e) => {
+                log.push(format!("headset: {}, will redo lookups", e));
+                None
             }
         }
-        None
     }
 }
 
@@ -747,8 +726,8 @@ pub mod tests {
     struct FakeBackend {
         infos: Vec<HidInfo>,
         devices: fn() -> Vec<FakeDevice>,
-        /// First request byte the fake headset answers (None = silent).
-        raw_accept: Option<u8>,
+        /// How the fake G522 behaves.
+        raw_mode: crate::headset::tests::Mode,
         raw_sent: Rc<RefCell<Vec<Vec<u8>>>>,
     }
 
@@ -756,7 +735,7 @@ pub mod tests {
         FakeBackend {
             infos,
             devices,
-            raw_accept: None,
+            raw_mode: crate::headset::tests::Mode::Silent,
             raw_sent: Rc::default(),
         }
     }
@@ -777,10 +756,9 @@ pub mod tests {
         }
         type R = FakeRaw;
         fn open_raw(&mut self, info: &HidInfo) -> Result<FakeRaw, String> {
-            use crate::headset::tests::*;
-            let n = info.output_len as usize;
+            assert!(crate::headset::is_headset_iface(info));
             Ok(FakeRaw {
-                dev: FakeHeadset::new(n, self.raw_accept, vec![pad(&EX_ACK, n), pad(&EX_BATTERY_CHARGING, n)]),
+                dev: crate::headset::tests::FakeHeadset::new(self.raw_mode),
                 sent: self.raw_sent.clone(),
             })
         }
@@ -793,12 +771,9 @@ pub mod tests {
     }
 
     impl RawLink for FakeRaw {
-        fn write_file(&mut self, buf: &[u8]) -> Result<(), String> {
+        fn write(&mut self, buf: &[u8]) -> Result<(), String> {
             self.sent.borrow_mut().push(buf.to_vec());
-            self.dev.write_file(buf)
-        }
-        fn set_output_report(&mut self, buf: &[u8]) -> Result<(), String> {
-            self.dev.set_output_report(buf)
+            self.dev.write(buf)
         }
         fn read(&mut self, t: Duration) -> Result<Option<Vec<u8>>, String> {
             self.dev.read(t)
@@ -871,42 +846,52 @@ pub mod tests {
     }
 
     #[test]
-    fn poller_headset_variant_remembered() {
+    fn poller_headset_centurion_cached() {
+        use crate::headset::tests::Mode;
         let mut be = backend(vec![g522(0x000C, 2, 1), g522(0xFF13, 62, 2), g522(0xFFA0, 64, 3)], no_devices);
-        be.raw_accept = Some(0x00);
+        be.raw_mode = Mode::Online;
         let mut poller = Poller::default();
         let mut log = Vec::new();
         let r = poller.poll(&mut be, &mut log);
         assert_eq!(r.mouse, None);
         let h = r.headset.unwrap();
-        assert_eq!((h.percent, h.charging, h.approx), (57, true, false));
-        let rf = poller.raw.clone().unwrap();
-        assert_eq!(rf.variant, Variant::B);
-        assert!(rf.path.contains("col02"));
+        assert_eq!((h.percent, h.charging, h.approx), (85, true, false));
+        assert_eq!(poller.centurion, Some(crate::headset::Indices { bridge: 5, battery: 7 }));
         {
             let sent = be.raw_sent.borrow();
-            assert_eq!(sent.len(), 2);
-            assert_eq!((sent[0].len(), sent[0][0]), (62, 0x51));
-            assert_eq!((sent[1].len(), sent[1][0]), (62, 0x00));
+            assert_eq!(sent.len(), 3);
+            assert!(sent.iter().all(|f| f.len() == 64 && f[0] == 0x50));
         }
         be.raw_sent.borrow_mut().clear();
         let r2 = poller.poll(&mut be, &mut log);
         assert_eq!(r2, r);
-        // Only the remembered variant is sent on later polls.
+        // Only the battery read on later polls.
         assert_eq!(be.raw_sent.borrow().len(), 1);
-        assert_eq!(be.raw_sent.borrow()[0][0], 0x00);
+        assert!(log.is_empty(), "{:?}", log);
     }
 
     #[test]
-    fn silent_headset_shows_nothing() {
-        let mut be = backend(vec![g522(0xFF13, 62, 2), g522(0xFFA0, 64, 3)], no_devices);
+    fn headset_offline_or_silent_shows_nothing() {
+        use crate::headset::tests::Mode;
+        for (mode, logged) in [(Mode::Offline, false), (Mode::Rejected, true), (Mode::Silent, true)] {
+            let mut be = backend(vec![g522(0xFF13, 62, 2), g522(0xFFA0, 64, 3)], no_devices);
+            be.raw_mode = mode;
+            let mut poller = Poller::default();
+            let mut log = Vec::new();
+            let r = poller.poll(&mut be, &mut log);
+            assert_eq!(r, Readings::default());
+            assert_eq!(poller.centurion, None);
+            assert_eq!(!log.is_empty(), logged, "{:?} {:?}", mode, log);
+        }
+    }
+
+    #[test]
+    fn no_g522_no_headset_request() {
+        let mut be = backend(vec![g522(0xFF13, 62, 2)], no_devices);
         let mut poller = Poller::default();
         let mut log = Vec::new();
-        let r = poller.poll(&mut be, &mut log);
-        assert_eq!(r, Readings::default());
-        assert_eq!(poller.raw, None);
-        // A and B on each collection, nothing else.
-        assert_eq!(be.raw_sent.borrow().len(), 4);
+        assert_eq!(poller.poll(&mut be, &mut log), Readings::default());
+        assert!(be.raw_sent.borrow().is_empty());
     }
 
     #[test]

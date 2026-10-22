@@ -816,7 +816,7 @@ fn spawn_poller(hwnd: HWND, shared: Arc<Mutex<Readings>>, log_path: PathBuf, rx:
                 }));
                 readings.headset = h.unwrap_or_else(|_| {
                     log.push("headset poll failed unexpectedly (panic); will retry".into());
-                    poller.raw = None;
+                    poller.centurion = None;
                     None
                 });
             }

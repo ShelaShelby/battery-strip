@@ -1,4 +1,4 @@
-# Report (0.2.0)
+# Report (0.3.0)
 
 Built without Windows or Logitech hardware; checked by unit tests and the
 Windows CI only.
@@ -6,33 +6,25 @@ Windows CI only.
 ## Verified
 - Windows CI: `cargo test --release`, `cargo build --release`, preview PNGs,
   smoke `--probe` on the runner, release `latest` republished at head.
-- Mouse (user's probe.txt, 0.1.0): receiver C543, device index 0x01,
-  UNIFIED_BATTERY at feature index 0x07. This path is unchanged.
-- G522 (user's probe.txt): PID 0B18, interface 3, collections FF13 (in/out
-  62) and FFA0 (in/out 64) open shared read/write. The old 20-byte HID++
-  write failed with Win32 error 87; the headset was never queried.
-- Unit tests (50): packet builder for variants A/B/C at exact lengths 62 and
-  64, signature decoder (valid, wrong prefix/type/marker, percent 0/101/255
-  rejected, 1/100 accepted, charging flag), ACK-then-data, at most 4 reads,
-  variant fallback order and stop on first reply, WriteFile ->
-  HidD_SetOutputReport fallback, per-variant error text, silent-device
-  timeouts, remembered variant in polling, FF13/FFA0 never get HID++.
-  The example bytes in the tests are marked "unverified on G522".
-- Windows code type-checked locally against windows-sys 0.59.
+- Protocol taken from HeadsetControl 4.0.0
+  (`logitech_centurion_protocol.hpp`, `logitech_g522_lightspeed.hpp`).
+- Unit tests: the worked vectors a) to f) (direct Root lookup frame, bridge
+  Root lookup of 0x0104, bridge battery read, answer parse 85 % charging,
+  ACK / disconnect / rejected, bad prefix / LEN 0, 1 / LEN too long), percent
+  0..100 and state 1/2, at most 8 frames per request, timeout and write
+  error text, index 0 = not found, cached indices (later polls send only the
+  battery read), offline keeps the cache, any other error clears it, only
+  the G522 FFA0 interface 3 gets Centurion frames, FF13/FFA0 never get HID++.
+- Windows code type-checked and clippy-clean for x86_64-pc-windows-msvc.
 
 ## Still unverified (needs the real PC)
-- Whether the G522 answers this request at all, on FF13 or FFA0, and with
-  which variant. The protocol comes from HeadsetControl PR #478 (PRO X 2).
-- Reply layout (byte 10 percent, byte 12 = 02 charging) on the G522.
-- Report IDs of the G522 collections (now logged from HidP caps).
-- Whether HidD_SetOutputReport behaves differently from WriteFile there.
+- The G522 replies themselves (real bridge_index, battery_index, percent).
 
 ## Behaviour
-- Headset value is shown only for a matching reply; else grey "H --".
-- Polling: mouse is read and published first; the headset request runs
-  afterwards with 700 ms read timeouts (1 s write timeout), so a silent
-  headset never delays the mouse. 60 s interval unchanged.
+- Mouse first, then one short Centurion session (open, query, close),
+  shared mode so G HUB stays open. 1000 ms per read, at most 8 frames.
+- Headset off (disconnect event): grey "H --", not logged as an error.
 
 ## Next step
 Run "Run probe" from the tray (or `--probe`) and send probe.txt; the
-"Headset probe" section shows the raw replies.
+"Centurion probe" section shows every frame.

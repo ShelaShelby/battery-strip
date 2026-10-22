@@ -326,24 +326,15 @@ impl Link for WinLink {
     }
 }
 
-/// One headset collection: exact-length writes, overlapped reads.
+/// The Centurion collection: 64-byte WriteFile, 64-byte overlapped reads.
 pub struct WinRawLink {
     reader: Reader,
     write_event: Handle,
 }
 
 impl RawLink for WinRawLink {
-    fn write_file(&mut self, buf: &[u8]) -> Result<(), String> {
+    fn write(&mut self, buf: &[u8]) -> Result<(), String> {
         overlapped_write(self.reader.file.0, self.write_event.0, buf)
-    }
-
-    fn set_output_report(&mut self, buf: &[u8]) -> Result<(), String> {
-        let ok = unsafe { HidD_SetOutputReport(self.reader.file.0, buf.as_ptr() as *const _, buf.len() as u32) };
-        if ok == 0 {
-            Err(last_error())
-        } else {
-            Ok(())
-        }
     }
 
     fn read(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>, String> {
@@ -399,7 +390,7 @@ impl Backend for WinBackend {
 
     fn open_raw(&mut self, info: &HidInfo) -> Result<WinRawLink, String> {
         let h = open_path(&info.path, GENERIC_READ | GENERIC_WRITE, true)?;
-        let reader = Reader::new(h, info.input_len as usize)?;
+        let reader = Reader::new(h, crate::headset::FRAME_LEN)?;
         let ev = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
         if ev.is_null() {
             return Err(last_error());
