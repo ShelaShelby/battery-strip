@@ -1,0 +1,71 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+
+      - name: Unit tests
+        run: cargo test --release --locked
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Preview PNGs and smoke probe
+        shell: pwsh
+        run: |
+          $exe = Join-Path $PWD 'target\release\battery-strip.exe'
+          $out = Join-Path $PWD 'preview'
+          $p = Start-Process -FilePath $exe -ArgumentList @('--preview', $out) -Wait -PassThru -NoNewWindow
+          if ($p.ExitCode -ne 0) { throw "preview failed with exit code $($p.ExitCode)" }
+          foreach ($f in 'preview-light.png', 'preview-dark.png') {
+            if (-not (Test-Path (Join-Path $out $f))) { throw "missing $f" }
+          }
+          # Probe on the runner (no Logitech hardware): must not crash and must write probe.txt.
+          $p = Start-Process -FilePath $exe -ArgumentList @('--probe', '--no-dialog') -Wait -PassThru -NoNewWindow
+          if ($p.ExitCode -ne 0) { throw "probe failed with exit code $($p.ExitCode)" }
+          Get-Content (Join-Path $PWD 'target\release\probe.txt')
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: battery-strip
+          path: |
+            target/release/battery-strip.exe
+            target/release/probe.txt
+            preview/*.png
+
+      - name: Publish release "latest"
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          git push origin :refs/tags/latest || true
+          gh release create latest target/release/battery-strip.exe \
+            --target "$GITHUB_SHA" \
+            --title "Battery Strip (latest build)" \
+            --notes "Automated build of ${GITHUB_SHA}. Unsigned exe: Windows SmartScreen may warn, click More info > Run anyway. Run with --probe first and send probe.txt." \
+            --latest
+          gh release view latest --json tagName,targetCommitish,assets
