@@ -1,37 +1,38 @@
-# Report
+# Report (0.2.0)
 
-Built without Windows or Logitech hardware. Hardware/OS behaviour is written
-from documented HID++ 2.0 / Win32 knowledge and checked only by the Windows CI.
+Built without Windows or Logitech hardware; checked by unit tests and the
+Windows CI only.
 
 ## Verified
-- Windows CI (windows-latest): `cargo test --release`, `cargo build --release`,
-  release `latest` republished with `battery-strip.exe` at the head commit.
-- Unit tests (35): HID++ frame building, reply/error matching (incl. ignoring
-  G HUB traffic), feature-table lookup, battery decoding for 0x1004, 0x1000,
-  0x1001, 0x1F20, device classification, colour thresholds, text format,
-  taskbar placement maths (tray, fallback, multi-monitor, vertical, auto-hide,
-  DPI), settings round-trip, log rotation, PNG encoder, renderer invariants,
-  and a full scan/poll against an emulated receiver (mouse + headset).
-- CI runs `--preview` (same renderer + placement code, real Segoe UI) and
-  uploads `preview-light.png` / `preview-dark.png` as artifacts.
-- CI runs `--probe --no-dialog` on the runner: HID enumeration, open and
-  probe.txt writing run without crashing (no Logitech devices there).
+- Windows CI: `cargo test --release`, `cargo build --release`, preview PNGs,
+  smoke `--probe` on the runner, release `latest` republished at head.
+- Mouse (user's probe.txt, 0.1.0): receiver C543, device index 0x01,
+  UNIFIED_BATTERY at feature index 0x07. This path is unchanged.
+- G522 (user's probe.txt): PID 0B18, interface 3, collections FF13 (in/out
+  62) and FFA0 (in/out 64) open shared read/write. The old 20-byte HID++
+  write failed with Win32 error 87; the headset was never queried.
+- Unit tests (50): packet builder for variants A/B/C at exact lengths 62 and
+  64, signature decoder (valid, wrong prefix/type/marker, percent 0/101/255
+  rejected, 1/100 accepted, charging flag), ACK-then-data, at most 4 reads,
+  variant fallback order and stop on first reply, WriteFile ->
+  HidD_SetOutputReport fallback, per-variant error text, silent-device
+  timeouts, remembered variant in polling, FF13/FFA0 never get HID++.
+  The example bytes in the tests are marked "unverified on G522".
+- Windows code type-checked locally against windows-sys 0.59.
 
-## Not verified (needs the real PC)
-- Mouse readout: G PRO 2 LIGHTSPEED is expected to answer on device index
-  0x01..0x06 of the receiver's 0xFF00 long-report collection with
-  UNIFIED_BATTERY; not tested on hardware.
-- Headset readout (G522): UNCONFIRMED. Third-party access to its battery is
-  undocumented; all interfaces (usage page >= 0xFF00) and indices (0xFF,
-  1-6) are tried. If nothing answers the strip shows grey "H --".
-- ADC_MEASUREMENT (0x1F20) flag meaning (bit0 valid, bit1 charging) and the
-  voltage-to-% curve are taken from public reverse-engineering (Solaar).
-- Taskbar placement on real Windows 11: TrayNotifyWnd rect on the primary
-  taskbar, Shell_SecondaryTrayWnd fallback offset (default 140 logical px,
-  configurable), staying above the taskbar after clicks, fullscreen hiding.
-- Co-existence with a running G HUB (shared opens, rotating software IDs
-  0xA-0xF, feature index cross-check) is reasoned, not observed.
-- Tray menu, autostart key, Explorer restart (TaskbarCreated) handling.
+## Still unverified (needs the real PC)
+- Whether the G522 answers this request at all, on FF13 or FFA0, and with
+  which variant. The protocol comes from HeadsetControl PR #478 (PRO X 2).
+- Reply layout (byte 10 percent, byte 12 = 02 charging) on the G522.
+- Report IDs of the G522 collections (now logged from HidP caps).
+- Whether HidD_SetOutputReport behaves differently from WriteFile there.
+
+## Behaviour
+- Headset value is shown only for a matching reply; else grey "H --".
+- Polling: mouse is read and published first; the headset request runs
+  afterwards with 700 ms read timeouts (1 s write timeout), so a silent
+  headset never delays the mouse. 60 s interval unchanged.
 
 ## Next step
-Run `battery-strip.exe --probe` and send probe.txt.
+Run "Run probe" from the tray (or `--probe`) and send probe.txt; the
+"Headset probe" section shows the raw replies.

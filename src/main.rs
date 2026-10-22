@@ -2,6 +2,7 @@
 #![cfg_attr(not(windows), allow(dead_code))]
 
 mod display;
+mod headset;
 mod hidpp;
 mod layout;
 mod logfile;

@@ -2,6 +2,7 @@
 //! The Windows HID backend implements `Link`/`Backend`; tests use a fake.
 //! Only read-only HID++ getters are ever sent.
 
+use crate::headset::{self, RawLink, Variant};
 use crate::hidpp::{self, feature, Battery, Kind, Reply, LONG_LEN, PARAMS_LEN};
 use std::time::{Duration, Instant};
 
@@ -14,6 +15,11 @@ pub struct HidInfo {
     pub usage: u16,
     pub input_len: u16,
     pub output_len: u16,
+    pub feature_len: u16,
+    /// Report IDs from HidP_GetValueCaps/HidP_GetButtonCaps (sorted, unique).
+    pub input_ids: Vec<u8>,
+    pub output_ids: Vec<u8>,
+    pub feature_ids: Vec<u8>,
     pub interface: Option<u8>,
     pub product: String,
 }
@@ -32,11 +38,33 @@ impl HidInfo {
             self.product
         )
     }
+
+    /// HidP_GetCaps report lengths and report IDs.
+    pub fn caps_line(&self) -> String {
+        fn ids(v: &[u8]) -> String {
+            if v.is_empty() {
+                "none".into()
+            } else {
+                v.iter().map(|b| format!("0x{:02X}", b)).collect::<Vec<_>>().join(",")
+            }
+        }
+        format!(
+            "caps: InputReportByteLength {}, OutputReportByteLength {}, FeatureReportByteLength {}; report IDs input {} output {} feature {}",
+            self.input_len,
+            self.output_len,
+            self.feature_len,
+            ids(&self.input_ids),
+            ids(&self.output_ids),
+            ids(&self.feature_ids)
+        )
+    }
 }
 
 /// Logitech vendor-specific collection that can carry long HID++ reports.
+/// Headset collections (0xFF13/0xFFA0) are not HID++ and get only the
+/// headset battery request (see `headset`).
 pub fn is_candidate(i: &HidInfo) -> bool {
-    i.vid == hidpp::VID_LOGITECH && i.usage_page >= 0xFF00 && i.output_len as usize >= LONG_LEN
+    i.vid == hidpp::VID_LOGITECH && i.usage_page >= 0xFF00 && i.output_len as usize >= LONG_LEN && !headset::is_headset_iface(i)
 }
 
 /// Parse "&mi_02" from a Windows HID path.
@@ -86,6 +114,9 @@ pub trait Backend {
     /// Open shared (never exclusive); `sibling` is an optional short-report
     /// collection to also read from.
     fn open(&mut self, info: &HidInfo, sibling: Option<&HidInfo>) -> Result<Self::L, String>;
+    type R: RawLink;
+    /// Open one collection shared read/write for the headset request.
+    fn open_raw(&mut self, info: &HidInfo) -> Result<Self::R, String>;
 }
 
 #[derive(Debug)]
@@ -472,29 +503,55 @@ pub struct Readings {
     pub headset: Option<Battery>,
 }
 
+/// Headset collection and request variant that got a reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawFound {
+    pub path: String,
+    pub variant: Variant,
+}
+
 /// Normal-mode poller: re-read known devices, rescan for missing ones.
 #[derive(Default)]
 pub struct Poller {
     pub mouse: Option<Found>,
     pub headset: Option<Found>,
+    /// Remembered (in memory only) headset request variant.
+    pub raw: Option<RawFound>,
 }
 
 impl Poller {
-    pub fn poll<B: Backend>(&mut self, backend: &mut B, log: &mut Vec<String>) -> Readings {
-        let infos = match backend.enumerate() {
-            Ok(i) => i,
+    pub fn enumerate<B: Backend>(backend: &mut B, log: &mut Vec<String>) -> Option<Vec<HidInfo>> {
+        match backend.enumerate() {
+            Ok(i) => Some(i),
             Err(e) => {
                 log.push(format!("HID enumeration failed: {}", e));
-                return Readings::default();
+                None
             }
+        }
+    }
+
+    /// Full poll in one go (the app splits it to publish the mouse first).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn poll<B: Backend>(&mut self, backend: &mut B, log: &mut Vec<String>) -> Readings {
+        let Some(infos) = Self::enumerate(backend, log) else {
+            return Readings::default();
         };
+        let mut r = self.poll_hidpp(backend, &infos, log);
+        if r.headset.is_none() {
+            r.headset = self.poll_headset(backend, &infos, log);
+        }
+        r
+    }
+
+    /// HID++ devices (mouse, and a HID++ headset if there is one).
+    pub fn poll_hidpp<B: Backend>(&mut self, backend: &mut B, infos: &[HidInfo], log: &mut Vec<String>) -> Readings {
         let mut r = Readings::default();
         for (slot, out, name) in [
             (&mut self.mouse, &mut r.mouse, "mouse"),
             (&mut self.headset, &mut r.headset, "headset"),
         ] {
             if let Some(f) = slot.clone() {
-                match read_found(backend, &infos, &f, log) {
+                match read_found(backend, infos, &f, log) {
                     Ok(b) => *out = Some(b),
                     Err(e) => {
                         log.push(format!("{}: re-read failed ({}), will rescan", name, e));
@@ -505,7 +562,7 @@ impl Poller {
         }
         if r.mouse.is_none() || r.headset.is_none() {
             let mut scan_log = Vec::new();
-            let res = scan(backend, &infos, false, false, &mut scan_log);
+            let res = scan(backend, infos, false, false, &mut scan_log);
             for ir in &res {
                 for d in &ir.devices {
                     let (Ok(b), Some((id, idx))) = (&d.battery, d.battery_feature) else {
@@ -535,6 +592,51 @@ impl Poller {
         }
         r
     }
+
+    /// Non-HID++ headset request on 0xFF13/0xFFA0 collections. Bounded by
+    /// the per-report timeouts; run after the mouse has been published.
+    pub fn poll_headset<B: Backend>(&mut self, backend: &mut B, infos: &[HidInfo], log: &mut Vec<String>) -> Option<Battery> {
+        let cands: Vec<&HidInfo> = infos.iter().filter(|i| headset::is_headset_iface(i)).collect();
+        let mut scratch = Vec::new();
+        if let Some(rf) = self.raw.clone() {
+            if let Some(info) = cands.iter().find(|i| i.path == rf.path) {
+                match backend.open_raw(info) {
+                    Ok(mut link) => {
+                        let q = headset::query(&mut link, rf.variant, info.output_len as usize, &mut scratch);
+                        if q.error.is_none() {
+                            return q.battery;
+                        }
+                        log.push(format!(
+                            "headset: request failed ({}), will retry all variants",
+                            q.error.unwrap_or_default()
+                        ));
+                    }
+                    Err(e) => log.push(format!("headset: open failed ({}), will retry", e)),
+                }
+            }
+            self.raw = None;
+        }
+        for info in cands {
+            let Ok(mut link) = backend.open_raw(info) else {
+                continue;
+            };
+            let res = headset::try_variants(&mut link, headset::caps_report_id(info), info.output_len as usize, &mut scratch);
+            if let Some(v) = res.variant {
+                log.push(format!(
+                    "headset: PID {:04X} usage page {:04X} replies to variant {}",
+                    info.pid,
+                    info.usage_page,
+                    v.label()
+                ));
+                self.raw = Some(RawFound {
+                    path: info.path.clone(),
+                    variant: v,
+                });
+                return res.battery;
+            }
+        }
+        None
+    }
 }
 
 fn read_found<B: Backend>(backend: &mut B, infos: &[HidInfo], f: &Found, log: &mut Vec<String>) -> Result<Battery, String> {
@@ -548,7 +650,9 @@ fn read_found<B: Backend>(backend: &mut B, infos: &[HidInfo], f: &Found, log: &m
 #[cfg(test)]
 pub mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::collections::VecDeque;
+    use std::rc::Rc;
 
     /// Emulates a receiver with HID++ 2.0 devices at some indices.
     pub struct FakeDevice {
@@ -643,6 +747,18 @@ pub mod tests {
     struct FakeBackend {
         infos: Vec<HidInfo>,
         devices: fn() -> Vec<FakeDevice>,
+        /// First request byte the fake headset answers (None = silent).
+        raw_accept: Option<u8>,
+        raw_sent: Rc<RefCell<Vec<Vec<u8>>>>,
+    }
+
+    fn backend(infos: Vec<HidInfo>, devices: fn() -> Vec<FakeDevice>) -> FakeBackend {
+        FakeBackend {
+            infos,
+            devices,
+            raw_accept: None,
+            raw_sent: Rc::default(),
+        }
     }
 
     impl Backend for FakeBackend {
@@ -659,6 +775,34 @@ pub mod tests {
                 noise: true,
             })
         }
+        type R = FakeRaw;
+        fn open_raw(&mut self, info: &HidInfo) -> Result<FakeRaw, String> {
+            use crate::headset::tests::*;
+            let n = info.output_len as usize;
+            Ok(FakeRaw {
+                dev: FakeHeadset::new(n, self.raw_accept, vec![pad(&EX_ACK, n), pad(&EX_BATTERY_CHARGING, n)]),
+                sent: self.raw_sent.clone(),
+            })
+        }
+    }
+
+    /// Records what was sent to the fake headset in the backend.
+    struct FakeRaw {
+        dev: crate::headset::tests::FakeHeadset,
+        sent: Rc<RefCell<Vec<Vec<u8>>>>,
+    }
+
+    impl RawLink for FakeRaw {
+        fn write_file(&mut self, buf: &[u8]) -> Result<(), String> {
+            self.sent.borrow_mut().push(buf.to_vec());
+            self.dev.write_file(buf)
+        }
+        fn set_output_report(&mut self, buf: &[u8]) -> Result<(), String> {
+            self.dev.set_output_report(buf)
+        }
+        fn read(&mut self, t: Duration) -> Result<Option<Vec<u8>>, String> {
+            self.dev.read(t)
+        }
     }
 
     fn info(path: &str, usage: u16, len: u16) -> HidInfo {
@@ -672,6 +816,7 @@ pub mod tests {
             output_len: len,
             interface: interface_from_path(path),
             product: "USB Receiver".into(),
+            ..Default::default()
         }
     }
 
@@ -694,6 +839,76 @@ pub mod tests {
         ]
     }
 
+    fn g522(usage_page: u16, len: u16, col: u8) -> HidInfo {
+        HidInfo {
+            path: format!(r"\\?\hid#vid_046d&pid_0b18&mi_03&col{:02}#x", col),
+            vid: 0x046D,
+            pid: 0x0B18,
+            usage_page,
+            usage: 1,
+            input_len: len,
+            output_len: len,
+            interface: Some(3),
+            product: "G522 LIGHTSPEED".into(),
+            ..Default::default()
+        }
+    }
+
+    fn no_devices() -> Vec<FakeDevice> {
+        vec![]
+    }
+
+    #[test]
+    fn headset_ifaces_never_get_hidpp() {
+        let i = g522(0xFFA0, 64, 3);
+        assert!(!is_candidate(&i));
+        assert!(!is_candidate(&g522(0xFF13, 62, 2)));
+        let mut be = backend(vec![g522(0x000C, 2, 1), g522(0xFF13, 62, 2), i], no_devices);
+        let infos = be.enumerate().unwrap();
+        let mut log = Vec::new();
+        assert!(scan(&mut be, &infos, true, true, &mut log).is_empty());
+        assert!(be.raw_sent.borrow().is_empty());
+    }
+
+    #[test]
+    fn poller_headset_variant_remembered() {
+        let mut be = backend(vec![g522(0x000C, 2, 1), g522(0xFF13, 62, 2), g522(0xFFA0, 64, 3)], no_devices);
+        be.raw_accept = Some(0x00);
+        let mut poller = Poller::default();
+        let mut log = Vec::new();
+        let r = poller.poll(&mut be, &mut log);
+        assert_eq!(r.mouse, None);
+        let h = r.headset.unwrap();
+        assert_eq!((h.percent, h.charging, h.approx), (57, true, false));
+        let rf = poller.raw.clone().unwrap();
+        assert_eq!(rf.variant, Variant::B);
+        assert!(rf.path.contains("col02"));
+        {
+            let sent = be.raw_sent.borrow();
+            assert_eq!(sent.len(), 2);
+            assert_eq!((sent[0].len(), sent[0][0]), (62, 0x51));
+            assert_eq!((sent[1].len(), sent[1][0]), (62, 0x00));
+        }
+        be.raw_sent.borrow_mut().clear();
+        let r2 = poller.poll(&mut be, &mut log);
+        assert_eq!(r2, r);
+        // Only the remembered variant is sent on later polls.
+        assert_eq!(be.raw_sent.borrow().len(), 1);
+        assert_eq!(be.raw_sent.borrow()[0][0], 0x00);
+    }
+
+    #[test]
+    fn silent_headset_shows_nothing() {
+        let mut be = backend(vec![g522(0xFF13, 62, 2), g522(0xFFA0, 64, 3)], no_devices);
+        let mut poller = Poller::default();
+        let mut log = Vec::new();
+        let r = poller.poll(&mut be, &mut log);
+        assert_eq!(r, Readings::default());
+        assert_eq!(poller.raw, None);
+        // A and B on each collection, nothing else.
+        assert_eq!(be.raw_sent.borrow().len(), 4);
+    }
+
     #[test]
     fn path_helpers() {
         let p = r"\\?\HID#VID_046D&PID_C54D&MI_02&Col02#8&1a2b&0&0001#{4d1e55b2-f16f-11cf-88cb-001111000030}";
@@ -711,10 +926,7 @@ pub mod tests {
     fn scan_finds_mouse_and_headset_with_table() {
         let p2 = r"\\?\hid#vid_046d&pid_c54d&mi_02&col02#x";
         let p1 = r"\\?\hid#vid_046d&pid_c54d&mi_02&col01#x";
-        let mut be = FakeBackend {
-            infos: vec![info(p1, 1, 7), info(p2, 2, 20)],
-            devices,
-        };
+        let mut be = backend(vec![info(p1, 1, 7), info(p2, 2, 20)], devices);
         let infos = be.enumerate().unwrap();
         let mut log = Vec::new();
         let res = scan(&mut be, &infos, true, true, &mut log);
@@ -738,10 +950,7 @@ pub mod tests {
     #[test]
     fn poller_reads_then_rereads_cached() {
         let p2 = r"\\?\hid#vid_046d&pid_c54d&mi_02&col02#x";
-        let mut be = FakeBackend {
-            infos: vec![info(p2, 2, 20)],
-            devices,
-        };
+        let mut be = backend(vec![info(p2, 2, 20)], devices);
         let mut poller = Poller::default();
         let mut log = Vec::new();
         let r = poller.poll(&mut be, &mut log);
@@ -764,10 +973,7 @@ pub mod tests {
             }]
         }
         let p2 = r"\\?\hid#vid_046d&pid_c54d&mi_02&col02#x";
-        let mut be = FakeBackend {
-            infos: vec![info(p2, 2, 20)],
-            devices: none,
-        };
+        let mut be = backend(vec![info(p2, 2, 20)], none);
         let mut log = Vec::new();
         let r = Poller::default().poll(&mut be, &mut log);
         assert_eq!(r, Readings::default());

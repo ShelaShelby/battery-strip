@@ -2,6 +2,7 @@
 //! overlapped reads/writes with timeouts.
 
 use super::wide;
+use crate::headset::RawLink;
 use crate::scan::{interface_from_path, Backend, HidInfo, Link};
 use std::time::{Duration, Instant};
 use windows_sys::core::GUID;
@@ -13,7 +14,45 @@ use windows_sys::Win32::System::Threading::*;
 use windows_sys::Win32::System::IO::*;
 
 fn last_error() -> String {
-    format!("Win32 error {}", unsafe { GetLastError() })
+    win32_text(unsafe { GetLastError() })
+}
+
+/// "Win32 error N (meaning)" for the codes seen with HID writes.
+fn win32_text(e: u32) -> String {
+    let what = match e {
+        1 => " (incorrect function)",
+        5 => " (access denied)",
+        6 => " (invalid handle)",
+        31 => " (device not functioning)",
+        87 => " (invalid parameter)",
+        121 => " (semaphore timeout)",
+        995 => " (I/O aborted)",
+        1167 => " (device not connected)",
+        _ => "",
+    };
+    format!("Win32 error {}{}", e, what)
+}
+
+/// Sorted unique report IDs of one report type (value + button caps).
+unsafe fn report_ids(pp: PHIDP_PREPARSED_DATA, kind: HIDP_REPORT_TYPE, nvalues: u16, nbuttons: u16) -> Vec<u8> {
+    let mut ids = Vec::new();
+    if nvalues > 0 {
+        let mut v: Vec<HIDP_VALUE_CAPS> = vec![std::mem::zeroed(); nvalues as usize];
+        let mut n = nvalues;
+        if HidP_GetValueCaps(kind, v.as_mut_ptr(), &mut n, pp) == HIDP_STATUS_SUCCESS {
+            ids.extend(v[..(n as usize).min(v.len())].iter().map(|c| c.ReportID));
+        }
+    }
+    if nbuttons > 0 {
+        let mut b: Vec<HIDP_BUTTON_CAPS> = vec![std::mem::zeroed(); nbuttons as usize];
+        let mut n = nbuttons;
+        if HidP_GetButtonCaps(kind, b.as_mut_ptr(), &mut n, pp) == HIDP_STATUS_SUCCESS {
+            ids.extend(b[..(n as usize).min(b.len())].iter().map(|c| c.ReportID));
+        }
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    ids
 }
 
 struct Handle(HANDLE);
@@ -74,6 +113,12 @@ fn read_info(path: &str) -> Option<HidInfo> {
             info.usage = caps.Usage;
             info.input_len = caps.InputReportByteLength;
             info.output_len = caps.OutputReportByteLength;
+            info.feature_len = caps.FeatureReportByteLength;
+            unsafe {
+                info.input_ids = report_ids(pp, HidP_Input, caps.NumberInputValueCaps, caps.NumberInputButtonCaps);
+                info.output_ids = report_ids(pp, HidP_Output, caps.NumberOutputValueCaps, caps.NumberOutputButtonCaps);
+                info.feature_ids = report_ids(pp, HidP_Feature, caps.NumberFeatureValueCaps, caps.NumberFeatureButtonCaps);
+            }
         }
         unsafe { HidD_FreePreparsedData(pp) };
     }
@@ -207,6 +252,33 @@ impl Drop for Reader {
     }
 }
 
+/// WriteFile on an overlapped handle, 1 s timeout.
+fn overlapped_write(file: HANDLE, event: HANDLE, buf: &[u8]) -> Result<(), String> {
+    let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
+    ov.hEvent = event;
+    let ok = unsafe { WriteFile(file, buf.as_ptr(), buf.len() as u32, std::ptr::null_mut(), &mut ov) };
+    if ok == 0 {
+        let e = unsafe { GetLastError() };
+        if e != ERROR_IO_PENDING {
+            return Err(format!("WriteFile failed: {}", win32_text(e)));
+        }
+        let w = unsafe { WaitForSingleObject(event, 1000) };
+        if w != WAIT_OBJECT_0 {
+            let mut n = 0u32;
+            unsafe {
+                CancelIoEx(file, &ov);
+                GetOverlappedResult(file, &ov, &mut n, 1);
+            }
+            return Err("write timeout".into());
+        }
+    }
+    let mut n = 0u32;
+    if unsafe { GetOverlappedResult(file, &ov, &mut n, 1) } == 0 {
+        return Err(format!("write failed: {}", last_error()));
+    }
+    Ok(())
+}
+
 pub struct WinLink {
     out_len: usize,
     readers: Vec<Reader>,
@@ -217,30 +289,7 @@ impl Link for WinLink {
     fn write(&mut self, report: &[u8]) -> Result<(), String> {
         let mut buf = vec![0u8; self.out_len.max(report.len())];
         buf[..report.len()].copy_from_slice(report);
-        let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
-        ov.hEvent = self.write_event.0;
-        let file = self.readers[0].file.0;
-        let ok = unsafe { WriteFile(file, buf.as_ptr(), buf.len() as u32, std::ptr::null_mut(), &mut ov) };
-        if ok == 0 {
-            let e = unsafe { GetLastError() };
-            if e != ERROR_IO_PENDING {
-                return Err(format!("WriteFile failed: Win32 error {}", e));
-            }
-            let w = unsafe { WaitForSingleObject(self.write_event.0, 1000) };
-            if w != WAIT_OBJECT_0 {
-                let mut n = 0u32;
-                unsafe {
-                    CancelIoEx(file, &ov);
-                    GetOverlappedResult(file, &ov, &mut n, 1);
-                }
-                return Err("write timeout".into());
-            }
-        }
-        let mut n = 0u32;
-        if unsafe { GetOverlappedResult(file, &ov, &mut n, 1) } == 0 {
-            return Err(format!("write failed: {}", last_error()));
-        }
-        Ok(())
+        overlapped_write(self.readers[0].file.0, self.write_event.0, &buf)
     }
 
     fn read(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>, String> {
@@ -277,6 +326,45 @@ impl Link for WinLink {
     }
 }
 
+/// One headset collection: exact-length writes, overlapped reads.
+pub struct WinRawLink {
+    reader: Reader,
+    write_event: Handle,
+}
+
+impl RawLink for WinRawLink {
+    fn write_file(&mut self, buf: &[u8]) -> Result<(), String> {
+        overlapped_write(self.reader.file.0, self.write_event.0, buf)
+    }
+
+    fn set_output_report(&mut self, buf: &[u8]) -> Result<(), String> {
+        let ok = unsafe { HidD_SetOutputReport(self.reader.file.0, buf.as_ptr() as *const _, buf.len() as u32) };
+        if ok == 0 {
+            Err(last_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn read(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>, String> {
+        if let Some(rep) = self.reader.arm()? {
+            return Ok(Some(rep));
+        }
+        if !self.reader.pending {
+            return Ok(None);
+        }
+        let ms = timeout.as_millis().min(10_000) as u32;
+        let w = unsafe { WaitForSingleObject(self.reader.event.0, ms) };
+        if w == WAIT_TIMEOUT {
+            return Ok(None);
+        }
+        if w != WAIT_OBJECT_0 {
+            return Err(format!("wait failed: {}", last_error()));
+        }
+        self.reader.finish().map(Some)
+    }
+}
+
 pub struct WinBackend;
 
 impl Backend for WinBackend {
@@ -303,6 +391,21 @@ impl Backend for WinBackend {
         Ok(WinLink {
             out_len: info.output_len as usize,
             readers,
+            write_event: Handle(ev),
+        })
+    }
+
+    type R = WinRawLink;
+
+    fn open_raw(&mut self, info: &HidInfo) -> Result<WinRawLink, String> {
+        let h = open_path(&info.path, GENERIC_READ | GENERIC_WRITE, true)?;
+        let reader = Reader::new(h, info.input_len as usize)?;
+        let ev = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        if ev.is_null() {
+            return Err(last_error());
+        }
+        Ok(WinRawLink {
+            reader,
             write_event: Handle(ev),
         })
     }

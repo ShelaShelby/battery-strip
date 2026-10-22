@@ -784,8 +784,19 @@ fn spawn_poller(hwnd: HWND, shared: Arc<Mutex<Readings>>, log_path: PathBuf, rx:
         let mut last: Option<Readings> = None;
         loop {
             let mut log = Vec::new();
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| poller.poll(&mut WinBackend, &mut log)));
-            let readings = match r {
+            let publish = |r: Readings| {
+                match shared.lock() {
+                    Ok(mut g) => *g = r,
+                    Err(p) => *p.into_inner() = r,
+                }
+                unsafe { PostMessageW(hwnd_val as HWND, WM_APP_BATTERY, 0, 0) };
+            };
+            let infos = Poller::enumerate(&mut WinBackend, &mut log);
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &infos {
+                Some(i) => poller.poll_hidpp(&mut WinBackend, i, &mut log),
+                None => Readings::default(),
+            }));
+            let mut readings = match r {
                 Ok(r) => r,
                 Err(_) => {
                     log.push("poll failed unexpectedly (panic); will retry".into());
@@ -793,6 +804,22 @@ fn spawn_poller(hwnd: HWND, shared: Arc<Mutex<Readings>>, log_path: PathBuf, rx:
                     Readings::default()
                 }
             };
+            if let (None, Some(infos)) = (readings.headset, &infos) {
+                // Mouse first (keeping the last headset value), so a silent
+                // headset never delays it; then the bounded headset request.
+                publish(Readings {
+                    headset: last.and_then(|l| l.headset),
+                    ..readings
+                });
+                let h = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    poller.poll_headset(&mut WinBackend, infos, &mut log)
+                }));
+                readings.headset = h.unwrap_or_else(|_| {
+                    log.push("headset poll failed unexpectedly (panic); will retry".into());
+                    poller.raw = None;
+                    None
+                });
+            }
             if last != Some(readings) {
                 log.push(format!(
                     "mouse {} | headset {}",
@@ -802,11 +829,7 @@ fn spawn_poller(hwnd: HWND, shared: Arc<Mutex<Readings>>, log_path: PathBuf, rx:
                 last = Some(readings);
             }
             logfile::append(&log_path, &log);
-            match shared.lock() {
-                Ok(mut g) => *g = readings,
-                Err(p) => *p.into_inner() = readings,
-            }
-            unsafe { PostMessageW(hwnd_val as HWND, WM_APP_BATTERY, 0, 0) };
+            publish(readings);
             match rx.recv_timeout(POLL) {
                 Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
